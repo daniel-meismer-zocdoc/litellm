@@ -6056,14 +6056,23 @@ async def test_bridge_refresh_upstream_invalid_grant_maps_to_invalid_grant():
 
 
 @pytest.mark.asyncio
-async def test_refresh_http_200_invalid_refresh_token_maps_to_invalid_grant():
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "bad_refresh_token",
+        "expired_refresh_token",
+        "invalid_refresh_token",
+        "token_expired",
+    ),
+)
+async def test_refresh_http_200_permanent_error_maps_to_invalid_grant(error_code):
     from litellm.proxy._experimental.mcp_server.discoverable_endpoints import exchange_token_with_server
 
     server = _create_oauth2_server()
     error_response = MagicMock()
     error_response.status_code = 200
     error_response.json.return_value = {
-        "error": "invalid_refresh_token",
+        "error": error_code,
         "error_description": "refresh token expired",
     }
     error_response.raise_for_status = MagicMock()
@@ -6095,7 +6104,16 @@ async def test_refresh_http_200_invalid_refresh_token_maps_to_invalid_grant():
 
 
 @pytest.mark.asyncio
-async def test_bridge_refresh_http_200_invalid_refresh_token_maps_to_invalid_grant():
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "bad_refresh_token",
+        "expired_refresh_token",
+        "invalid_refresh_token",
+        "token_expired",
+    ),
+)
+async def test_bridge_refresh_http_200_permanent_error_maps_to_invalid_grant(error_code):
     from litellm.types.mcp import MCPAuth
 
     server = _bridge_server(auth_type=MCPAuth.oauth_delegate)
@@ -6104,11 +6122,108 @@ async def test_bridge_refresh_http_200_invalid_refresh_token_maps_to_invalid_gra
     response = await _refresh_for_bridge_server(
         server,
         refresh_env,
-        {"error": "invalid_refresh_token", "error_description": "refresh token expired"},
+        {"error": error_code, "error_description": "refresh token expired"},
     )
 
     assert response.status_code == 400
     assert json.loads(response.body)["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "bad_refresh_token",
+        "expired_refresh_token",
+        "invalid_refresh_token",
+        "token_expired",
+    ),
+)
+async def test_authorization_code_http_200_permanent_refresh_error_is_not_normalized(error_code):
+    response = await _exchange_with_upstream_response(_upstream_token_response(200, json_body={"error": error_code}))
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == error_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    (
+        "bad_refresh_token",
+        "expired_refresh_token",
+        "invalid_refresh_token",
+        "token_expired",
+    ),
+)
+async def test_bridge_authorization_code_http_200_permanent_refresh_error_is_not_normalized(error_code):
+    from litellm.types.mcp import MCPAuth
+
+    response = await _exchange_for_bridge_server(
+        _bridge_server(auth_type=MCPAuth.oauth_delegate),
+        {"error": error_code},
+        key_hash="active-key-hash",
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == error_code
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", ({}, [], {"ok": False}))
+async def test_http_200_without_access_token_is_protocol_fault(payload):
+    response = await _exchange_with_upstream_response(_upstream_token_response(200, json_body=payload))
+
+    assert response.status_code == 502
+    body = json.loads(response.body)
+    assert body["error"] == "server_error"
+    assert "correlation_id=" in body["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_bridge_http_200_without_access_token_is_protocol_fault():
+    from litellm.types.mcp import MCPAuth
+
+    response = await _exchange_for_bridge_server(
+        _bridge_server(auth_type=MCPAuth.oauth_delegate),
+        {},
+        key_hash="active-key-hash",
+    )
+
+    assert response.status_code == 502
+    assert json.loads(response.body)["error"] == "server_error"
+
+
+@pytest.mark.asyncio
+async def test_http_200_invalid_json_is_protocol_fault():
+    response = await _exchange_with_upstream_response(_upstream_token_response(200, text_body="not-json"))
+
+    assert response.status_code == 502
+    assert json.loads(response.body)["error"] == "server_error"
+
+
+@pytest.mark.asyncio
+async def test_http_200_protocol_fault_keeps_details_in_logs(caplog):
+    response = await _exchange_with_upstream_response(
+        _upstream_token_response(
+            200,
+            json_body={"ok": False, "provider_detail": "must-never-appear"},
+        )
+    )
+
+    body = json.loads(response.body)
+    description = body["error_description"]
+    diagnostics = "\n".join(caplog.messages)
+    assert "correlation_id=" in description
+    assert "gcal" not in description
+    assert "upstream_status" not in description
+    assert "known_fields" not in description
+    assert "server=gcal" in diagnostics
+    assert "upstream_status=200" in diagnostics
+    assert "known_fields=['ok']" in diagnostics
+    assert "unknown_field_count=1" in diagnostics
+    assert "provider_detail" not in diagnostics
+    assert "must-never-appear" not in diagnostics
 
 
 @pytest.mark.asyncio
@@ -7858,14 +7973,14 @@ async def test_token_exchange_bounds_relayed_error_fields():
 
 @pytest.mark.asyncio
 async def test_token_exchange_200_without_access_token_is_502_not_keyerror():
-    """A 200 whose body has no usable access_token used to KeyError into a 500; the raw arm now
-    answers 502 with the same wording as the bridge arm's no_upstream_token rejection."""
+    """A 200 whose body has no usable access_token returns a traceable 502 without response details."""
     response = await _exchange_with_upstream_response(_upstream_token_response(200, json_body={"token_type": "Bearer"}))
 
     assert response.status_code == 502
     body = json.loads(response.body)
     assert body["error"] == "server_error"
-    assert "access_token" in body["error_description"]
+    assert "correlation_id=" in body["error_description"]
+    assert "access_token" not in body["error_description"]
 
 
 @pytest.mark.asyncio

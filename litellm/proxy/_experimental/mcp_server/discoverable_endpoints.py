@@ -930,8 +930,36 @@ def _token_credential_source(mcp_server: MCPServer) -> CredentialSource:
     return "gateway_stored" if mcp_server.client_id else "caller_supplied"
 
 
+_PERMANENT_REFRESH_ERROR_ALIASES: Final = frozenset(
+    {
+        "bad_refresh_token",
+        "expired_refresh_token",
+        "invalid_refresh_token",
+        "token_expired",
+    }
+)
+_SAFE_TOKEN_RESPONSE_FIELD_NAMES: Final = frozenset(
+    {
+        "access_token",
+        "error",
+        "error_description",
+        "error_uri",
+        "expires_in",
+        "id_token",
+        "ok",
+        "refresh_token",
+        "scope",
+        "token_type",
+    }
+)
+
+
 def _normalize_refresh_token_fault(fault: UpstreamOAuthFault, grant_type: str) -> UpstreamOAuthFault:
-    if grant_type == "refresh_token" and isinstance(fault, CallerRejected) and fault.code == "invalid_refresh_token":
+    if (
+        grant_type == "refresh_token"
+        and isinstance(fault, CallerRejected)
+        and fault.code in _PERMANENT_REFRESH_ERROR_ALIASES
+    ):
         return CallerRejected(
             code="invalid_grant",
             description=fault.description,
@@ -969,6 +997,37 @@ def _render_upstream_token_rejection(
         )
         return _bridge_mint_error_response("invalid_refresh")
     return render_token_fault(fault)
+
+
+def _render_token_response_protocol_fault(
+    *, response: httpx.Response, mcp_server: MCPServer, token_response: object, reason: str
+) -> JSONResponse:
+    correlation_id: Final = secrets.token_hex(8)
+    fields: Final = token_response if isinstance(token_response, dict) else {}
+    known_fields: Final = sorted(
+        key for key in fields if isinstance(key, str) and key in _SAFE_TOKEN_RESPONSE_FIELD_NAMES
+    )
+    unknown_field_count: Final = sum(
+        1 for key in fields if not isinstance(key, str) or key not in _SAFE_TOKEN_RESPONSE_FIELD_NAMES
+    )
+    response_type: Final = type(token_response).__name__
+    verbose_logger.warning(
+        "MCP upstream token protocol fault correlation_id=%s server=%s "
+        "upstream_status=%s reason=%s response_type=%s known_fields=%s "
+        "unknown_field_count=%s",
+        correlation_id,
+        mcp_server.server_id,
+        response.status_code,
+        reason,
+        response_type,
+        known_fields,
+        unknown_field_count,
+    )
+    return render_token_fault(
+        UpstreamProtocolFault(
+            note=(f"upstream token endpoint returned an invalid success response (correlation_id={correlation_id})")
+        )
+    )
 
 
 async def exchange_token_with_server(
@@ -1127,9 +1186,26 @@ async def exchange_token_with_server(
             status_code=502,
             detail="MCP upstream token endpoint returned no response",
         )
-    token_response = response.json()
+    try:
+        token_response: Final = response.json()
+    except ValueError:
+        return _render_token_response_protocol_fault(
+            response=response,
+            mcp_server=mcp_server,
+            token_response=None,
+            reason="invalid_json",
+        )
     if isinstance(token_response, dict) and isinstance(token_response.get("error"), str):
         return _render_upstream_token_rejection(response, mcp_server, grant_type, is_bridge)
+
+    raw_access_token: Final = token_response.get("access_token") if isinstance(token_response, dict) else None
+    if not isinstance(raw_access_token, str) or not raw_access_token:
+        return _render_token_response_protocol_fault(
+            response=response,
+            mcp_server=mcp_server,
+            token_response=token_response,
+            reason="missing_access_token",
+        )
 
     # Validate token response against server-configured rules before any storage.
     # This rejects tokens from wrong Slack workspaces, Atlassian orgs, etc.
@@ -1179,10 +1255,6 @@ async def exchange_token_with_server(
         # OAuth-shaped response as the phase-1 preconditions.
         minted: Final = _finish_bridge_mint(bridge_mint_ready, mcp_server, token_response, datetime.now(timezone.utc))
         return minted if isinstance(minted, JSONResponse) else _bridge_mint_error_response(minted)
-
-    raw_access_token: Final = token_response.get("access_token") if isinstance(token_response, dict) else None
-    if not isinstance(raw_access_token, str) or not raw_access_token:
-        return render_token_fault(UpstreamProtocolFault(note="the upstream token response has no usable access_token"))
 
     result: Final = {
         "access_token": raw_access_token,
