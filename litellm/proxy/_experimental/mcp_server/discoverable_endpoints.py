@@ -36,6 +36,7 @@ from litellm.proxy._experimental.mcp_server.bridge_token_flow import (
 from litellm.proxy._experimental.mcp_server.faults import (
     CallerRejected,
     CredentialSource,
+    UpstreamOAuthFault,
     UpstreamProtocolFault,
     classify_upstream_dcr_rejection,
     classify_upstream_token_rejection,
@@ -929,6 +930,47 @@ def _token_credential_source(mcp_server: MCPServer) -> CredentialSource:
     return "gateway_stored" if mcp_server.client_id else "caller_supplied"
 
 
+def _normalize_refresh_token_fault(fault: UpstreamOAuthFault, grant_type: str) -> UpstreamOAuthFault:
+    if grant_type == "refresh_token" and isinstance(fault, CallerRejected) and fault.code == "invalid_refresh_token":
+        return CallerRejected(
+            code="invalid_grant",
+            description=fault.description,
+            error_uri=fault.error_uri,
+        )
+    return fault
+
+
+def _render_upstream_token_rejection(
+    response: httpx.Response,
+    mcp_server: MCPServer,
+    grant_type: str,
+    is_bridge: bool,
+) -> JSONResponse:
+    fault: Final = _normalize_refresh_token_fault(
+        classify_upstream_token_rejection(
+            response,
+            credential_source=_token_credential_source(mcp_server),
+            log_context=mcp_server.server_id,
+        ),
+        grant_type,
+    )
+    upstream_rejected_bridge_refresh: Final = (
+        is_bridge
+        and grant_type == "refresh_token"
+        and isinstance(fault, CallerRejected)
+        and fault.code == "invalid_grant"
+    )
+    if upstream_rejected_bridge_refresh:
+        verbose_logger.info(
+            "bridge refresh: the upstream rejected the sealed refresh token for server=%s with "
+            "invalid_grant (revoked or expired at the IdP); returning invalid_grant so the client "
+            "re-runs authorization_code rather than an opaque upstream error",
+            mcp_server.server_id,
+        )
+        return _bridge_mint_error_response("invalid_refresh")
+    return render_token_fault(fault)
+
+
 async def exchange_token_with_server(
     request: Request,
     mcp_server: MCPServer,
@@ -1074,32 +1116,20 @@ async def exchange_token_with_server(
         if response is not None:
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:
-        fault: Final = classify_upstream_token_rejection(
+        return _render_upstream_token_rejection(
             exc.response,
-            credential_source=_token_credential_source(mcp_server),
-            log_context=mcp_server.server_id,
+            mcp_server,
+            grant_type,
+            is_bridge,
         )
-        upstream_rejected_bridge_refresh: Final = (
-            is_bridge
-            and grant_type == "refresh_token"
-            and isinstance(fault, CallerRejected)
-            and fault.code == "invalid_grant"
-        )
-        if upstream_rejected_bridge_refresh:
-            verbose_logger.info(
-                "bridge refresh: the upstream rejected the sealed refresh token for server=%s with "
-                "invalid_grant (revoked or expired at the IdP); returning invalid_grant so the client "
-                "re-runs authorization_code rather than an opaque upstream error",
-                mcp_server.server_id,
-            )
-            return _bridge_mint_error_response("invalid_refresh")
-        return render_token_fault(fault)
     if response is None:
         raise HTTPException(
             status_code=502,
             detail="MCP upstream token endpoint returned no response",
         )
     token_response = response.json()
+    if isinstance(token_response, dict) and isinstance(token_response.get("error"), str):
+        return _render_upstream_token_rejection(response, mcp_server, grant_type, is_bridge)
 
     # Validate token response against server-configured rules before any storage.
     # This rejects tokens from wrong Slack workspaces, Atlassian orgs, etc.

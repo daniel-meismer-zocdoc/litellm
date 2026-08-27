@@ -6056,6 +6056,62 @@ async def test_bridge_refresh_upstream_invalid_grant_maps_to_invalid_grant():
 
 
 @pytest.mark.asyncio
+async def test_refresh_http_200_invalid_refresh_token_maps_to_invalid_grant():
+    from litellm.proxy._experimental.mcp_server.discoverable_endpoints import exchange_token_with_server
+
+    server = _create_oauth2_server()
+    error_response = MagicMock()
+    error_response.status_code = 200
+    error_response.json.return_value = {
+        "error": "invalid_refresh_token",
+        "error_description": "refresh token expired",
+    }
+    error_response.raise_for_status = MagicMock()
+    fake_http_client = MagicMock()
+    fake_http_client.post = AsyncMock(return_value=error_response)
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.discoverable_endpoints.get_async_httpx_client",
+        return_value=fake_http_client,
+    ):
+        response = await exchange_token_with_server(
+            request=MagicMock(),
+            mcp_server=server,
+            grant_type="refresh_token",
+            code=None,
+            redirect_uri=None,
+            client_id="test_client_id",
+            client_secret="test_client_secret",
+            code_verifier=None,
+            refresh_token="expired-refresh-token",
+        )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {
+        "error": "invalid_grant",
+        "error_description": "refresh token expired",
+    }
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_bridge_refresh_http_200_invalid_refresh_token_maps_to_invalid_grant():
+    from litellm.types.mcp import MCPAuth
+
+    server = _bridge_server(auth_type=MCPAuth.oauth_delegate)
+    refresh_env = _mint_test_refresh_envelope(server_id=server.server_id, upstream_refresh="UPSTREAM-REFRESH")
+
+    response = await _refresh_for_bridge_server(
+        server,
+        refresh_env,
+        {"error": "invalid_refresh_token", "error_description": "refresh token expired"},
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
 async def test_bridge_refresh_upstream_error_detection_parses_json_not_substring():
     """The upstream invalid_grant detection reads the classified RFC 6749 5.2 error code, not a substring
     of the body. An upstream error whose code is not invalid_grant (here invalid_client, with the string
